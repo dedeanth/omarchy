@@ -1,0 +1,138 @@
+#!/bin/bash
+
+# omarchy:summary=Regulate Mac Pro fan speeds from CPU and GPU temperature.
+# omarchy:hidden=true
+
+# The SMC keeps the fans at their minimum until the operating system asks for
+# more. macOS has a daemon doing that; Linux has nothing, so a Mac Pro under
+# load sits above 90 C with its fans barely turning, and the CPU throttles.
+#
+# applesmc exposes no PWM channels, only fanN_manual and fanN_output, so
+# fancontrol cannot drive these fans and this reimplements the curve.
+
+smc=$(echo /sys/devices/platform/applesmc.*)
+interval=5
+
+# Fans are addressed by the name the SMC gives them rather than by index,
+# because the numbering differs between Mac models.
+cpu_fan_names=(EXHAUST INTAKE BOOSTA)
+gpu_fan_names=(PCI)
+
+# Below the floor a fan idles, above the ceiling it runs flat out, and the
+# speed is interpolated in between. A Radeon sitting at 70 C is normal and has
+# a fan of its own, so the PCI fan starts helping later than the CPU fans.
+cpu_floor=50
+cpu_ceiling=82
+gpu_floor=65
+gpu_ceiling=88
+
+fans_named() {
+  local wanted=$1 label_file label fan
+
+  for label_file in "$smc"/fan*_label; do
+    [[ -r $label_file ]] || continue
+
+    # The SMC pads its labels with trailing spaces.
+    read -r label <"$label_file"
+    [[ $label == "$wanted" ]] || continue
+
+    fan=${label_file##*/fan}
+    echo "${fan%_label}"
+  done
+}
+
+hwmon_for() {
+  local hwmon
+
+  for hwmon in /sys/class/hwmon/hwmon*; do
+    [[ -r $hwmon/name ]] || continue
+
+    if [[ $(< "$hwmon/name") == "$1" ]]; then
+      echo "$hwmon"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+highest_temp() {
+  local hwmon=$1 highest=0 reading input
+
+  [[ -n $hwmon ]] || return 1
+
+  for input in "$hwmon"/temp*_input; do
+    [[ -r $input ]] || continue
+    reading=$(( $(< "$input") / 1000 ))
+    (( reading > highest )) && highest=$reading
+  done
+
+  echo "$highest"
+}
+
+speed_for() {
+  local temp=$1 floor=$2 ceiling=$3 slowest=$4 fastest=$5
+
+  if (( temp <= floor )); then
+    echo "$slowest"
+  elif (( temp >= ceiling )); then
+    echo "$fastest"
+  else
+    echo $(( slowest + (fastest - slowest) * (temp - floor) / (ceiling - floor) ))
+  fi
+}
+
+drive_fan() {
+  local fan=$1 temp=$2 floor=$3 ceiling=$4 slowest fastest
+
+  read -r slowest <"$smc/fan${fan}_min" || return 0
+  read -r fastest <"$smc/fan${fan}_max" || return 0
+  speed_for "$temp" "$floor" "$ceiling" "$slowest" "$fastest" >"$smc/fan${fan}_output"
+}
+
+# Hand the fans back to the SMC on the way out, so stopping the service does
+# not leave them pinned at whatever speed was written last.
+release_fans() {
+  local fan
+
+  for fan in "${cpu_fans[@]}" "${gpu_fans[@]}"; do
+    echo 0 >"$smc/fan${fan}_manual"
+  done
+
+  exit 0
+}
+
+mapfile -t cpu_fans < <(for name in "${cpu_fan_names[@]}"; do fans_named "$name"; done)
+mapfile -t gpu_fans < <(for name in "${gpu_fan_names[@]}"; do fans_named "$name"; done)
+
+if (( ${#cpu_fans[@]} == 0 )); then
+  echo "No CPU fan found through applesmc; leaving fan control to the SMC" >&2
+  exit 1
+fi
+
+trap release_fans EXIT TERM INT
+
+coretemp=$(hwmon_for coretemp)
+amdgpu=$(hwmon_for amdgpu)
+
+while true; do
+  # Reasserted every pass because the SMC drops manual mode across suspend.
+  for fan in "${cpu_fans[@]}" "${gpu_fans[@]}"; do
+    echo 1 >"$smc/fan${fan}_manual"
+  done
+
+  cpu_temp=$(highest_temp "$coretemp")
+  for fan in "${cpu_fans[@]}"; do
+    drive_fan "$fan" "$cpu_temp" "$cpu_floor" "$cpu_ceiling"
+  done
+
+  if [[ -n $amdgpu ]]; then
+    gpu_temp=$(highest_temp "$amdgpu")
+    for fan in "${gpu_fans[@]}"; do
+      drive_fan "$fan" "$gpu_temp" "$gpu_floor" "$gpu_ceiling"
+    done
+  fi
+
+  sleep "$interval" &
+  wait $!
+done

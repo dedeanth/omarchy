@@ -1,0 +1,12 @@
+[Unit]
+Description=Regulate Mac Pro fan speeds from temperature
+ConditionPathExistsGlob=/sys/devices/platform/applesmc.*
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omarchy-hw-mac-pro-fan-control
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
