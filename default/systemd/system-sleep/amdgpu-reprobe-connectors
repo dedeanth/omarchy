@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# Re-detect display connectors that amdgpu loses across suspend.
+#
+# On pre-Navi Radeon cards the driver can come back from S3 without re-reading a
+# connected display's EDID: the connector reports "disconnected" with a
+# zero-length EDID and the compositor drops that output. Writing "detect" makes
+# the driver probe it again.
+#
+# Only connectors that were actually in use before suspending are considered,
+# and only once the driver has had a moment to find them on its own, so a
+# machine that resumes correctly does no work here.
+
+connector_list=/run/omarchy-amdgpu-connectors
+
+shopt -s nullglob
+
+amdgpu_connectors() {
+  local status_file connector card
+
+  for status_file in /sys/class/drm/card*-*/status; do
+    # /sys/class/drm/card1-HDMI-A-1/status belongs to card1.
+    connector=$(basename "$(dirname "$status_file")")
+    card=${connector%%-*}
+    [[ $(basename "$(readlink -f "/sys/class/drm/$card/device/driver")" 2>/dev/null) == "amdgpu" ]] || continue
+    echo "$status_file"
+  done
+}
+
+case "$1" in
+  pre)
+    : >"$connector_list"
+    for status_file in $(amdgpu_connectors); do
+      if [[ $(<"$status_file") == "connected" ]]; then
+        echo "$status_file" >>"$connector_list"
+      fi
+    done
+    ;;
+  post)
+    [[ -f $connector_list ]] || exit 0
+
+    while read -r status_file; do
+      [[ -e $status_file ]] || continue
+
+      # Give the driver a few seconds to complete its own detection before
+      # forcing one, so a normal resume is untouched.
+      for _ in {1..5}; do
+        [[ $(<"$status_file") == "connected" ]] && break
+        sleep 1
+      done
+
+      if [[ $(<"$status_file") != "connected" ]]; then
+        echo detect >"$status_file"
+        logger -t amdgpu-reprobe-connectors "forced a re-probe of ${status_file%/status}"
+      fi
+    done <"$connector_list"
+
+    rm -f "$connector_list"
+    ;;
+esac
