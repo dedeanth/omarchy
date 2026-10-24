@@ -15,12 +15,21 @@ monitor_lua="$home_dir/.config/hypr/monitors.lua"
 
 mkdir -p "$stub_bin" "$home_dir/.config/hypr"
 
-# OMARCHY_TEST_MONITOR_SCALES is a space-separated list, one scale per monitor.
+# OMARCHY_TEST_MONITOR_SCALES is a space-separated list, one scale per enabled
+# monitor; OMARCHY_TEST_DISABLED_SCALES lists the disabled ones, which only
+# `hyprctl monitors all` shows. OMARCHY_TEST_HYPRCTL_FAILS makes it fail.
 cat >"$stub_bin/hyprctl" <<'SH'
 #!/bin/bash
 
+[[ -z ${OMARCHY_TEST_HYPRCTL_FAILS:-} ]] || exit 1
+
 if [[ $1 == "monitors" && $2 == "-j" ]]; then
-  printf '%s\n' $OMARCHY_TEST_MONITOR_SCALES | jq -s -c 'map({scale: .})'
+  printf '%s\n' $OMARCHY_TEST_MONITOR_SCALES | jq -s -c 'map({scale: ., disabled: false})'
+elif [[ $1 == "monitors" && $2 == "all" && $3 == "-j" ]]; then
+  {
+    printf '%s\n' $OMARCHY_TEST_MONITOR_SCALES | jq -s -c 'map({scale: ., disabled: false})'
+    printf '%s\n' ${OMARCHY_TEST_DISABLED_SCALES:-} | jq -s -c 'map({scale: ., disabled: true})'
+  } | jq -s -c 'add'
 elif [[ $1 == "eval" ]]; then
   printf '%s\n' "$2" >"$OMARCHY_TEST_HYPRCTL_EVAL_OUT"
 else
@@ -44,6 +53,7 @@ run_gdk_scale() {
     OMARCHY_TEST_HYPRCTL_EVAL_OUT="$eval_out" \
     OMARCHY_TEST_DBUS_OUT="$dbus_out" \
     OMARCHY_TEST_MONITOR_SCALES="$1" \
+    OMARCHY_TEST_DISABLED_SCALES="${2:-}" \
     bash "$ROOT/install/user/first-run/gdk-scale.sh"
 }
 
@@ -88,6 +98,18 @@ sed -i 's|^local omarchy_monitor_scale = .*|local omarchy_monitor_scale = 1.25|'
 run_gdk_scale "1.25"
 grep -Fx 'local omarchy_gdk_scale = 2' "$monitor_lua" >/dev/null || fail "edited monitor scale leaves GDK scale alone"
 pass "edited monitors.lua is left alone"
+
+write_monitor_config
+run_gdk_scale "1" "2"
+grep -Fx 'local omarchy_gdk_scale = 2' "$monitor_lua" >/dev/null ||
+  fail "a 2x laptop panel disabled in clamshell mode keeps GDK scale 2"
+[[ ! -e $eval_out ]] || fail "a disabled panel leaves the running env alone"
+pass "a 2x laptop panel disabled in clamshell mode keeps GDK scale 2"
+
+write_monitor_config
+OMARCHY_TEST_HYPRCTL_FAILS=1 run_gdk_scale "1" || fail "a failing hyprctl is not an error"
+grep -Fx 'local omarchy_gdk_scale = 2' "$monitor_lua" >/dev/null || fail "a failing hyprctl leaves GDK scale alone"
+pass "a failing hyprctl leaves GDK scale alone"
 
 write_monitor_config
 run_gdk_scale ""

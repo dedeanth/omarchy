@@ -18,6 +18,13 @@ monitor_lua="$HOME/.config/hypr/monitors.lua"
 grep -qx 'local omarchy_monitor_scale = "auto"' "$monitor_lua" || exit 0
 grep -qx 'local omarchy_gdk_scale = 2' "$monitor_lua" || exit 0
 
+# A disabled output, such as a laptop panel shut in clamshell mode, is missing
+# from `hyprctl monitors`, so the largest scale below may not be this
+# machine's. Leave the template alone rather than guess.
+if hyprctl monitors all -j | jq -e 'any(.[]; .disabled == true)' >/dev/null 2>&1; then
+  exit 0
+fi
+
 # GTK only honors whole numbers, so round each monitor's scale the way
 # omarchy-hyprland-monitor-scaling does, and keep the largest: a HiDPI panel
 # in a mixed setup still gets 2x.
